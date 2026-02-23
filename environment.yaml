@@ -1,0 +1,15 @@
+name: ont
+channels:
+    - conda-forge
+    - bioconda
+    - nodefaults
+dependencies:
+    - bioconda::nanoplot=1.46.2
+    - bioconda::fastqc=0.12.1
+    - bioconda::pychopper=2.7.10
+    - bioconda::porechop_abi=0.5.1
+    - conda-forge::biopython=1.86
+    - conda-forge::r-tidyverse=2.0.0
+    - conda-forge::r-cowplot=1.2.0
+    - bioconda::minimap2=2.30
+    - bioconda::samtools=1.23
