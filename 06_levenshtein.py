@@ -2,7 +2,7 @@ import argparse
 import pysam
 from collections import Counter
 from rapidfuzz.distance import Levenshtein
-from tqdm import tqdm
+import tqdm
 
 # Create command line parser
 parser = argparse.ArgumentParser(
@@ -110,17 +110,14 @@ def main():
     with pysam.AlignmentFile(args.input, "rb") as reader:
         total_reads = reader.mapped
         with pysam.AlignmentFile(args.output, "wb", template=reader) as writer:
-            pbar = tqdm(total=total_reads, desc="Correcting Barcodes", unit="reads")
-
             current_rname = None
             reads_in_group = []
 
-            for read in reader:
+            for read in tqdm.tqdm(reader, total=total_reads, desc="Correcting Barcodes"):
                 rname = read.reference_name
                 if rname != current_rname:
                     if reads_in_group:
                         process_group(reads_in_group, writer)
-                        pbar.update(len(reads_in_group))
                     current_rname = rname
                     reads_in_group = [read]
                 else:
@@ -128,13 +125,11 @@ def main():
 
             if reads_in_group:
                 process_group(reads_in_group, writer)
-                pbar.update(len(reads_in_group))
-            pbar.close()
 
     # Final Summary Report
-    print("\n" + "="*40)
+    print("\n" + "=" * 40)
     print("BARCODE CORRECTION SUMMARY")
-    print("="*40)
+    print("=" * 40)
     print(f"Input file:      {args.input}")
     print(f"Target lengths:  {args.target_lengths}")
     print(f"Window size:     {args.window}")
@@ -143,18 +138,19 @@ def main():
     print("-" * 40)
     print(f"Total reads processed (with BC):  {STATS['total_reads_with_bc']:,}")
     print(f"Total reads corrected:            {STATS['total_corrected_reads']:,}")
-    
-    if STATS['total_reads_with_bc'] > 0:
-        corr_pct = (STATS['total_corrected_reads'] / STATS['total_reads_with_bc']) * 100
+
+    if STATS["total_reads_with_bc"] > 0:
+        corr_pct = (STATS["total_corrected_reads"] / STATS["total_reads_with_bc"]) * 100
         print(f"Correction rate:                  {corr_pct:.2f}%")
-        
+
     print("-" * 40)
     print(f"Unique barcodes (Before):         {len(STATS['unique_bcs_before']):,}")
     print(f"Unique barcodes (After):          {len(STATS['unique_bcs_after']):,}")
-    
-    unique_diff = len(STATS['unique_bcs_before']) - len(STATS['unique_bcs_after'])
+
+    unique_diff = len(STATS["unique_bcs_before"]) - len(STATS["unique_bcs_after"])
     print(f"Unique barcodes collapsed:        {unique_diff:,}")
-    print("="*40 + "\n")
+    print("=" * 40 + "\n")
+
 
 if __name__ == "__main__":
     main()
