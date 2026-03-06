@@ -108,12 +108,11 @@ def main():
     pysam.set_verbosity(0)
 
     with pysam.AlignmentFile(args.input, "rb") as reader:
-        total_reads = reader.mapped
         with pysam.AlignmentFile(args.output, "wb", template=reader) as writer:
             current_rname = None
             reads_in_group = []
 
-            for read in tqdm.tqdm(reader, total=total_reads, desc="Correcting Barcodes"):
+            for read in tqdm.tqdm(reader, desc="Processing reads"):
                 rname = read.reference_name
                 if rname != current_rname:
                     if reads_in_group:
