@@ -170,11 +170,18 @@ def process_group(reads, writer):
         old_bc = read.get_tag("BC")
         new_bc = correction_map.get(old_bc, old_bc)
 
+        # Add the original barcode to a new tag (OB) for traceability
+        read.set_tag("OB", old_bc)
+        
         if old_bc != new_bc:
             STATS["total_corrected_reads"] += 1
-
-            # Overwrite the BC tag in the BAM record with the corrected sequence
+            # Update the BC tag with the corrected sequence
             read.set_tag("BC", new_bc)
+            # Add a boolean flag ('XB') as True (1 in SAM)
+            read.set_tag("XB", True)
+        else:
+            # Add a boolean flag as False (0 in SAM)
+            read.set_tag("XB", False)
 
         STATS["unique_bcs_after"].add(new_bc)
         writer.write(read)
