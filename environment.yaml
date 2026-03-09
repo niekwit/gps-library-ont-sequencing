@@ -1,15 +1,21 @@
 name: ont
 channels:
-    - conda-forge
-    - bioconda
-    - nodefaults
+  - conda-forge
+  - bioconda
+  - nodefaults
 dependencies:
-    - bioconda::nanoplot=1.46.2
-    - bioconda::fastqc=0.12.1
-    - bioconda::pychopper=2.7.10
-    - bioconda::porechop_abi=0.5.1
-    - conda-forge::biopython=1.86
-    - conda-forge::r-tidyverse=2.0.0
-    - conda-forge::r-cowplot=1.2.0
-    - bioconda::minimap2=2.30
-    - bioconda::samtools=1.23
+  - conda-forge::ipykernel
+  - conda-forge::nbconvert
+  - bioconda::cutadapt=5.2
+  - bioconda::chopper=0.12.0
+  - bioconda::nanoplot=1.46.2
+  - bioconda::fastqc=0.12.1
+  - conda-forge::biopython=1.86
+  - bioconda::pysam=0.23.3
+  - conda-forge::rapidfuzz=3.14.3
+  - conda-forge::r-tidyverse=2.0.0
+  - conda-forge::r-cowplot=1.2.0
+  - bioconda::minimap2=2.30
+  - bioconda::samtools=1.22.1
+  - bioconda::seqkit=2.12.0
+  - conda-forge::tqdm=4.67.3
