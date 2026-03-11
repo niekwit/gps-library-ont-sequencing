@@ -3,50 +3,71 @@ Correct barcode sequences in a BAM file using Levenshtein distance.
 
 1. Setup and Argument Parsing
 
-    Initialization: The script defines parameters for what a "good" barcode looks like. Specifically, it targets sequences of length 24 or 30 (--target-lengths).
+    Initialization: The script defines parameters for what a "good" barcode looks like. 
+    Specifically, it targets sequences of length 24 or 30 (--target-lengths).
 
-    Thresholds: It sets limits for the "correction" (how different a sequence can be from the truth) using Levenshtein distance and a frequency ratio (the "true" barcode must be much more common than the "error").
+    Thresholds: It sets limits for the "correction" using Levenshtein distance and a 
+    frequency ratio (the "true" barcode must be much more common than the "error").
 
 2. The Main Loop (Grouping by Reference)
 
     Sequential Processing: The main() function iterates through the BAM file.
 
-    Coordinate-Based Chunking: It identifies when the reference_name changes (e.g., moving from one cDNA transcript to another) and gathers all reads for that specific transcript into a list (reads_in_group).
+    Coordinate-Based Chunking: It identifies when the reference_name changes (e.g., 
+    moving from one cDNA transcript to another) and gathers all reads for that 
+    specific transcript into a list (reads_in_group).
 
-    Memory Management: By processing one transcript group at a time, it avoids loading the entire file into memory while still allowing for localized barcode comparison.
+    Memory Management: By processing one transcript group at a time, it avoids 
+    loading the entire file into memory while still allowing for localized comparison.
 
 3. Analyzing Barcodes within a Group (process_group)
 
-    Frequency Counting: It uses Counter to determine how many times each unique barcode sequence appears within that specific genomic location.
+    Frequency Counting: It uses Counter to determine how many times each unique 
+    barcode sequence appears within that specific genomic location.
 
-    Identifying Centroids: It identifies "Centroid" sequences—these are barcodes that match the user-defined target lengths (24 or 30). These are considered the "potential truths."
+    Identifying Centroids: It identifies "Centroid" sequences—these are barcodes 
+    that match the user-defined target lengths (24 or 30). These are considered 
+    the "potential truths" or anchors for correction.
 
-    Sorting by Abundance: Unique barcodes are sorted from most frequent to least frequent to prioritize the most likely correct sequences as anchors.
+    Sorting by Abundance: Unique barcodes are sorted from most frequent to least 
+    frequent to prioritize the most likely correct sequences as anchors.
 
 4. The Correction Logic (The "Correction Map")
 
-For every barcode that isn't a perfect centroid, the script searches for a match among the centroids based on four strict criteria:
+    For every barcode sequence (including those of target length), the script 
+    searches for a better match among the identified centroids based on four criteria:
 
-    Abundance Ratio: The candidate centroid must have at least ratio_threshold times more reads than the current sequence (ensuring we don't collapse two equally frequent sequences).
+    Self-Exclusion: A sequence will not be compared against itself.
+    
+    Abundance Ratio: The candidate centroid must have at least ratio_threshold 
+    times more reads than the current sequence. This allows low-abundance 
+    "correct-length" barcodes to be collapsed into high-abundance ones.
 
-    Length Window: The length difference between the sequence and the centroid must be within the --window (e.g., ±2 bp).
+    Length Window: The length difference between the sequence and the centroid 
+    must be within the --window (e.g., ±2 bp).
 
-    Edit Distance: The Levenshtein distance (number of insertions, deletions, or substitutions) must be within --max-edit-dist.
+    Edit Distance: The Levenshtein distance (insertions, deletions, or 
+    substitutions) must be within --max-edit-dist.
 
-    Best Match Selection: If multiple centroids fit, it chooses the one with the smallest distance; if distances are equal, it chooses the one with the highest read count.
+    Best Match Selection: If multiple centroids fit, it chooses the one with the 
+    smallest distance; if distances are equal, it chooses the one with the 
+    highest read count.
 
 5. Applying Changes and Writing
 
-    Tag Updating: If a correction is found, read.set_tag("BC", new_bc) overwrites the original noisy sequence in the BAM record with the corrected centroid sequence.
+    Tag Updating: If a correction is found, read.set_tag("BC", new_bc) overwrites 
+    the original noisy sequence. The original sequence is preserved in the "OB" tag.
 
-    Preservation: Reads without any BC tag or those that don't meet the correction criteria are written to the output file unchanged to preserve data integrity.
+    Traceability: Every read is assigned an "XB" tag (boolean) indicating if a 
+    correction was applied.
 
 6. Metrics and Reporting
 
-    Tracking Stats: The STATS dictionary tracks "Before vs. After" metrics, such as how many unique barcodes were collapsed and the total percentage of reads that were modified.
+    Tracking Stats: The STATS dictionary tracks "Before vs. After" metrics, such 
+    as total corrected reads and unique barcode counts.
 
-    Summary: After the file is processed, it prints a report showing the efficiency of the correction—ideally, you want to see the "Unique barcodes (After)" count be significantly lower than the "Before" count.
-
+    Summary: After processing, it prints a report showing the efficiency of the 
+    collapse—helping to verify that noisy variants were successfully merged.
 """
 
 import argparse
@@ -82,7 +103,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--ratio-threshold",
-    type=int,
+    type=float,
     default=5,
     help="Minimum frequency ratio for correction (default: 5)",
 )
@@ -126,43 +147,33 @@ def process_group(reads, writer):
 
     # For each barcode, find a nearby highly-abundant Centroid to collapse into
     for seq in unique_bcs:
-        # If it's already a centroid, it maps to itself and so we can
-        # skip the distance calculations
-        if seq in centroids:
-            correction_map[seq] = seq
-            continue
-
         seq_count = counts[seq]
         candidates = []
 
-        # Compare each non-centroid sequence to all centroids and
-        # apply the correction criteria
+        # Compare each sequence to all potential centroids
         for c in centroids:
-            # The sequence must have at least ratio_threshold times more
-            # reads than the current sequence
+            # Skip self-comparison
+            if seq == c:
+                continue
+
+            # The candidate centroid must meet the abundance ratio threshold
             if counts[c] >= (seq_count * args.ratio_threshold):
+
                 # The length difference must be within the specified window
-                # This is due to ONT errors often causing small indels, so we
-                # allow for some flexibility in length
                 if abs(len(seq) - len(c)) <= args.window:
-                    # This calculates the minimum number of edits (substitutions,
-                    # insertions, deletions) needed to turn the error into the centroid.
-                    # It stops calculating if it realizes the distance will definitely
-                    # exceed the set limit (e.g. 2).
+
+                    # Calculate Levenshtein distance with a cutoff for efficiency
                     dist = Levenshtein.distance(seq, c, score_cutoff=args.max_edit_dist)
 
-                    # If the distance is within the cutoff, add it to the candidate list
                     if dist <= args.max_edit_dist:
                         candidates.append((dist, counts[c], c))
 
-        # If we found any candidates, choose the one with the
-        # smallest distance (and highest count if there's a tie)
+        # If candidates exist, choose the best (closest, then most abundant)
         if candidates:
             candidates.sort(key=lambda x: (x[0], -x[1]))
             correction_map[seq] = candidates[0][2]
         else:
-            # If no centroid meets the ratio, length, and distance requirements, it
-            # is assumed the sequence is unique
+            # No correction found
             correction_map[seq] = seq
 
     # Write updated reads and update "After" stats
@@ -170,17 +181,14 @@ def process_group(reads, writer):
         old_bc = read.get_tag("BC")
         new_bc = correction_map.get(old_bc, old_bc)
 
-        # Add the original barcode to a new tag (OB) for traceability
+        # Traceability tags
         read.set_tag("OB", old_bc)
-        
+
         if old_bc != new_bc:
             STATS["total_corrected_reads"] += 1
-            # Update the BC tag with the corrected sequence
             read.set_tag("BC", new_bc)
-            # Add a boolean flag ('XB') as True (1 in SAM)
             read.set_tag("XB", True)
         else:
-            # Add a boolean flag as False (0 in SAM)
             read.set_tag("XB", False)
 
         STATS["unique_bcs_after"].add(new_bc)
