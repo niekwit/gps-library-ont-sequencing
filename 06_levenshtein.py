@@ -119,6 +119,22 @@ STATS = {
 }
 
 
+def extract_gene_name(rname):
+    """
+    Extracts the gene name from a GenCode header string.
+    Example: ENST00000327044.7|ENSG00000188976.12|...|NOC2L|...
+    Returns 'NOC2L' or the full rname if parsing fails.
+    """
+    if not rname:
+        return None
+    parts = rname.split('|')
+    # GenCode usually has gene_name at index 5 (0-based)
+    # But it's safer to check for a common length or use a fallback
+    if len(parts) >= 6:
+        return parts[5] 
+    return rname
+
+
 def process_group(reads, writer):
     # Filter reads that actually have a BC tag
     reads_with_bc = [r for r in reads if r.has_tag("BC")]
@@ -200,17 +216,18 @@ def main():
 
     with pysam.AlignmentFile(args.input, "rb") as reader:
         with pysam.AlignmentFile(args.output, "wb", template=reader) as writer:
-            current_rname = None
+            current_gene = None
             reads_in_group = []
 
             for read in tqdm.tqdm(reader, desc="Processing reads"):
-                rname = read.reference_name
+                # Use our new extractor instead of just read.reference_name
+                gene = extract_gene_name(read.reference_name)
 
-                # Group reads by reference (cDNA) to process transcript-specific barcodes
-                if rname != current_rname:
+                # Group reads by Gene Name
+                if gene != current_gene:
                     if reads_in_group:
                         process_group(reads_in_group, writer)
-                    current_rname = rname
+                    current_gene = gene
                     reads_in_group = [read]
                 else:
                     reads_in_group.append(read)
