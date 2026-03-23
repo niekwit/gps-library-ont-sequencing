@@ -19,3 +19,7 @@ dependencies:
   - bioconda::samtools=1.22.1
   - bioconda::seqkit=2.12.0
   - conda-forge::tqdm=4.67.3
+  - bioconda::starcode=1.4
+  - conda-forge::seaborn=0.13.2
+  - bioconda::bowtie2=2.5.5
+  - bioconda::mygene=3.2.2
