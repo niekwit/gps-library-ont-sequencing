@@ -50,51 +50,42 @@ def get_pileup_consensus(reads, ref_len):
     suffix_pileup = [Counter() for _ in range(10)]
 
     for read in reads:
+        # Cache aligned pairs once per read to improve performance
+        aligned_pairs = read.get_aligned_pairs()
+        query_seq = read.query_sequence
+
         # Standard aligned bases
-        for q_pos, r_pos in read.get_aligned_pairs():
+        for q_pos, r_pos in aligned_pairs:
             if r_pos is not None and 0 <= r_pos < ref_len:
-                base = read.query_sequence[q_pos] if q_pos is not None else "-"
+                base = query_seq[q_pos] if q_pos is not None else "-"
                 pileup[r_pos][base] += 1
 
-        # Capture Prefixes (a potentially "lost" ATG)
-        # Find the first aligned reference position for this read
-        aligned_positions = [p[1] for p in read.get_aligned_pairs() if p[1] is not None]
-        if aligned_positions:
-            first_ref_idx = read.get_aligned_pairs().index(
-                (
-                    next(
-                        p[0]
-                        for p in read.get_aligned_pairs()
-                        if p[1] == aligned_positions[0]
-                    ),
-                    aligned_positions[0],
-                )
-            )
+        # Filter for pairs that actually map to the reference
+        ref_mapped_indices = [
+            i for i, p in enumerate(aligned_pairs) if p[1] is not None
+        ]
 
-            # Look backwards from the first aligned base in the read
+        if not ref_mapped_indices:
+            continue
+
+        # Capture Prefixes
+        first_idx = ref_mapped_indices[0]
+        q_idx_start = aligned_pairs[first_idx][0]
+
+        if q_idx_start is not None:
             for i in range(1, 11):
-                q_idx = read.get_aligned_pairs()[first_ref_idx][0]
-                if q_idx is not None and q_idx - i >= 0:
-                    pre_base = read.query_sequence[q_idx - i]
+                if q_idx_start - i >= 0:
+                    pre_base = query_seq[q_idx_start - i]
                     prefix_pileup[i - 1][pre_base] += 1
 
-        # Capture Suffixes (the "lost" Stop)
-        if aligned_positions:
-            last_ref_idx = read.get_aligned_pairs().index(
-                (
-                    next(
-                        p[0]
-                        for p in reversed(read.get_aligned_pairs())
-                        if p[1] == aligned_positions[-1]
-                    ),
-                    aligned_positions[-1],
-                )
-            )
+        # Capture Suffixes
+        last_idx = ref_mapped_indices[-1]
+        q_idx_end = aligned_pairs[last_idx][0]
 
+        if q_idx_end is not None:
             for i in range(1, 11):
-                q_idx = read.get_aligned_pairs()[last_ref_idx][0]
-                if q_idx is not None and q_idx + i < len(read.query_sequence):
-                    suf_base = read.query_sequence[q_idx + i]
+                if q_idx_end + i < len(query_seq):
+                    suf_base = query_seq[q_idx_end + i]
                     suffix_pileup[i - 1][suf_base] += 1
 
     # Build the final sequence
@@ -144,7 +135,7 @@ def process_to_csv():
             if total_reads < MIN_READS:
                 continue
 
-            # 1. Identify Majority Reference (Primary Isoform)
+            # Identify Majority Reference (Primary Isoform)
             ref_counts = Counter(r.reference_name for r in reads if r.reference_name)
             if not ref_counts:
                 continue
@@ -156,7 +147,7 @@ def process_to_csv():
 
             # Extract Gene/Transcript name (5th element of | separated header)
             header_parts = full_header.split("|")
-            short_name = header_parts[4] if len(header_parts) >= 5 else "Unknown"
+            short_name = header_parts[5] if len(header_parts) >= 6 else "Unknown"
 
             # Fetch GenCode cDNA sequence (from FASTA)
             try:
