@@ -3,70 +3,70 @@ Correct barcode sequences in a BAM file using Levenshtein distance.
 
 1. Setup and Argument Parsing
 
-    Initialization: The script defines parameters for what a "good" barcode looks like. 
+    Initialization: The script defines parameters for what a "good" barcode looks like.
     Specifically, it targets sequences of length 24 or 30 (--target-lengths).
 
-    Thresholds: It sets limits for the "correction" using Levenshtein distance and a 
+    Thresholds: It sets limits for the "correction" using Levenshtein distance and a
     frequency ratio (the "true" barcode must be much more common than the "error").
 
 2. The Main Loop (Grouping by Reference)
 
     Sequential Processing: The main() function iterates through the BAM file.
 
-    Coordinate-Based Chunking: It identifies when the reference_name changes (e.g., 
-    moving from one cDNA transcript to another) and gathers all reads for that 
+    Coordinate-Based Chunking: It identifies when the reference_name changes (e.g.,
+    moving from one cDNA transcript to another) and gathers all reads for that
     specific transcript into a list (reads_in_group).
 
-    Memory Management: By processing one transcript group at a time, it avoids 
+    Memory Management: By processing one transcript group at a time, it avoids
     loading the entire file into memory while still allowing for localized comparison.
 
 3. Analyzing Barcodes within a Group (process_group)
 
-    Frequency Counting: It uses Counter to determine how many times each unique 
+    Frequency Counting: It uses Counter to determine how many times each unique
     barcode sequence appears within that specific genomic location.
 
-    Identifying Centroids: It identifies "Centroid" sequences—these are barcodes 
-    that match the user-defined target lengths (24 or 30). These are considered 
+    Identifying Centroids: It identifies "Centroid" sequences—these are barcodes
+    that match the user-defined target lengths (24 or 30). These are considered
     the "potential truths" or anchors for correction.
 
-    Sorting by Abundance: Unique barcodes are sorted from most frequent to least 
+    Sorting by Abundance: Unique barcodes are sorted from most frequent to least
     frequent to prioritize the most likely correct sequences as anchors.
 
 4. The Correction Logic (The "Correction Map")
 
-    For every barcode sequence (including those of target length), the script 
+    For every barcode sequence (including those of target length), the script
     searches for a better match among the identified centroids based on four criteria:
 
     Self-Exclusion: A sequence will not be compared against itself.
-    
-    Abundance Ratio: The candidate centroid must have at least ratio_threshold 
-    times more reads than the current sequence. This allows low-abundance 
+
+    Abundance Ratio: The candidate centroid must have at least ratio_threshold
+    times more reads than the current sequence. This allows low-abundance
     "correct-length" barcodes to be collapsed into high-abundance ones.
 
-    Length Window: The length difference between the sequence and the centroid 
+    Length Window: The length difference between the sequence and the centroid
     must be within the --window (e.g., ±2 bp).
 
-    Edit Distance: The Levenshtein distance (insertions, deletions, or 
+    Edit Distance: The Levenshtein distance (insertions, deletions, or
     substitutions) must be within --max-edit-dist.
 
-    Best Match Selection: If multiple centroids fit, it chooses the one with the 
-    smallest distance; if distances are equal, it chooses the one with the 
+    Best Match Selection: If multiple centroids fit, it chooses the one with the
+    smallest distance; if distances are equal, it chooses the one with the
     highest read count.
 
 5. Applying Changes and Writing
 
-    Tag Updating: If a correction is found, read.set_tag("BC", new_bc) overwrites 
+    Tag Updating: If a correction is found, read.set_tag("BC", new_bc) overwrites
     the original noisy sequence. The original sequence is preserved in the "OB" tag.
 
-    Traceability: Every read is assigned an "XB" tag (boolean) indicating if a 
+    Traceability: Every read is assigned an "XB" tag (boolean) indicating if a
     correction was applied.
 
 6. Metrics and Reporting
 
-    Tracking Stats: The STATS dictionary tracks "Before vs. After" metrics, such 
+    Tracking Stats: The STATS dictionary tracks "Before vs. After" metrics, such
     as total corrected reads and unique barcode counts.
 
-    Summary: After processing, it prints a report showing the efficiency of the 
+    Summary: After processing, it prints a report showing the efficiency of the
     collapse—helping to verify that noisy variants were successfully merged.
 """
 
@@ -127,11 +127,11 @@ def extract_gene_name(rname):
     """
     if not rname:
         return None
-    parts = rname.split('|')
+    parts = rname.split("|")
     # GenCode usually has gene_name at index 5 (0-based)
     # But it's safer to check for a common length or use a fallback
     if len(parts) >= 6:
-        return parts[5] 
+        return parts[5]
     return rname
 
 
