@@ -69,7 +69,7 @@ parser.add_argument(
 args = parser.parse_args()
 
 # ---------------------------------------------------------------------------
-# Logging — INFO and above go to both console and file; DEBUG goes to file only
+# Logging — INFO goes to both console and file; all other levels to file only
 # ---------------------------------------------------------------------------
 _fmt = logging.Formatter(
     "%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
@@ -79,8 +79,17 @@ _file_handler = logging.FileHandler(args.log_file)
 _file_handler.setLevel(logging.DEBUG)
 _file_handler.setFormatter(_fmt)
 
+
+class _InfoOnly(logging.Filter):
+    """Passes only INFO-level records — keeps WARNING and above off the console."""
+
+    def filter(self, record):
+        return record.levelno == logging.INFO
+
+
 _console_handler = logging.StreamHandler()
 _console_handler.setLevel(logging.INFO)
+_console_handler.addFilter(_InfoOnly())
 _console_handler.setFormatter(_fmt)
 
 logging.basicConfig(level=logging.DEBUG, handlers=[_file_handler, _console_handler])
@@ -93,7 +102,8 @@ STATS = {
     "total_reads_with_bc": 0,
     "total_corrected_reads": 0,
     "unique_bcs_before": set(),  # all unique BC values seen before correction
-    "unique_bcs_after": set(),   # all unique BC values written to the output
+    "unique_bcs_after": set(),  # all unique BC values written to the output
+    "genes_skipped": 0,  # genes with ambiguous barcodes that could not be corrected
 }
 
 
@@ -149,7 +159,7 @@ def build_correction_map(ambiguous_bcs, ref_bcs, threshold):
 
         # Only record a correction when a better sequence was actually found
         if best_bc is not None and best_bc != bc:
-            log.debug("Correction mapped: %s -> %s (distance %d)", bc, best_bc, best_dist)
+            log.debug(f"Correction mapped: {bc} -> {best_bc} (distance {best_dist})")
             correction_map[bc] = best_bc
 
     return correction_map
@@ -188,29 +198,42 @@ def process_group(reads, writer, ref_by_gene):
 
         if close_pairs:
             gene = extract_gene_name(reads[0].reference_name)
-            log.debug("Gene %s: %d close barcode pair(s) found", gene, len(close_pairs))
+            log.debug(f"Gene {gene}: {len(close_pairs)} close barcode pair(s) found")
 
-            # Step 2: look up the known ("ground truth") barcodes for this
+            # Step 2: collect the full set of ambiguous barcodes (both members
+            # of every close pair) — needed for both the reference lookup and
+            # the length-based fallback below.
+            ambiguous = set()
+            for bc1, bc2, _ in close_pairs:
+                ambiguous.add(bc1)
+                ambiguous.add(bc2)
+
+            # Step 3: look up the known ("ground truth") barcodes for this
             # gene from the reference CSV. Without a reference we have no
             # anchor to decide which of the two close sequences is correct.
             ref_bcs = ref_by_gene.get(gene, [])
 
             if not ref_bcs:
-                log.warning(
-                    "Gene %s has %d ambiguous barcode pair(s) but no reference "
-                    "barcodes — skipping correction for this gene.",
-                    gene,
-                    len(close_pairs),
-                )
-            else:
-                # Step 3: collect the full set of ambiguous barcodes (both
-                # members of every close pair) and find the nearest reference
-                # barcode for each one.
-                ambiguous = set()
-                for bc1, bc2, _ in close_pairs:
-                    ambiguous.add(bc1)
-                    ambiguous.add(bc2)
+                # Fallback: if exactly one of the ambiguous barcodes has the
+                # expected length (24 or 30), it is almost certainly the true
+                # sequence — use it as a synthetic single-barcode reference.
+                target_len_bcs = [bc for bc in ambiguous if len(bc) in (24, 30)]
+                if len(target_len_bcs) == 1:
+                    log.debug(
+                        f"Gene {gene}: no CSV reference found; using length-"
+                        f"{len(target_len_bcs[0])} barcode {target_len_bcs[0]} "
+                        f"as fallback anchor."
+                    )
+                    ref_bcs = target_len_bcs
+                else:
+                    STATS["genes_skipped"] += 1
+                    log.warning(
+                        f"Gene {gene} has {len(close_pairs)} ambiguous barcode "
+                        f"pair(s) but no reference barcodes and no unambiguous "
+                        f"length-24/30 anchor — skipping correction for this gene."
+                    )
 
+            if ref_bcs:
                 correction_map = build_correction_map(
                     ambiguous, ref_bcs, args.threshold
                 )
@@ -227,7 +250,7 @@ def process_group(reads, writer, ref_by_gene):
         if old_bc != new_bc:
             STATS["total_corrected_reads"] += 1
             read.set_tag("BC", new_bc)
-            read.set_tag("XB", True)   # flag: this read was corrected
+            read.set_tag("XB", True)  # flag: this read was corrected
         else:
             read.set_tag("XB", False)  # flag: no correction applied
 
@@ -237,19 +260,19 @@ def process_group(reads, writer, ref_by_gene):
 
 def main():
     log.info("Starting reference barcode correction")
-    log.info("Input BAM:          %s", args.input)
-    log.info("Output BAM:         %s", args.output)
-    log.info("Reference CSV:      %s", args.reference)
-    log.info("Distance threshold: %d", args.threshold)
-    log.info("Reverse complement: %s", args.rc)
-    log.info("Log file:           %s", args.log_file)
+    log.info(f"Input BAM:          {args.input}")
+    log.info(f"Output BAM:         {args.output}")
+    log.info(f"Reference CSV:      {args.reference}")
+    log.info(f"Distance threshold: {args.threshold}")
+    log.info(f"Reverse complement: {args.rc}")
+    log.info(f"Log file:           {args.log_file}")
 
     # ---------------------------------------------------------------------------
     # Load the reference barcode table and index it by gene name for O(1) lookup
     # inside process_group. Rows with missing gene or barcode values are dropped
     # because they cannot contribute to a meaningful correction.
     # ---------------------------------------------------------------------------
-    log.info("Loading reference barcodes from: %s", args.reference)
+    log.info(f"Loading reference barcodes from: {args.reference}")
     ref_df = pd.read_csv(args.reference)
     ref_by_gene = (
         ref_df.dropna(subset=[args.gene_col, args.bc_col])
@@ -257,7 +280,7 @@ def main():
         .apply(list)
         .to_dict()
     )
-    log.info("Loaded reference barcodes for %d genes.", len(ref_by_gene))
+    log.info(f"Loaded reference barcodes for {len(ref_by_gene)} genes.")
 
     # Reverse complement all reference barcodes when the BC sequences in the
     # BAM were captured from the opposite strand to the reference CSV.
@@ -309,23 +332,25 @@ def main():
     log.info(divider)
     log.info("REFERENCE BARCODE CORRECTION SUMMARY")
     log.info(divider)
-    log.info("Input file:            %s", args.input)
-    log.info("Output file:           %s", args.output)
-    log.info("Reference file:        %s", args.reference)
-    log.info("Distance threshold:    %d", args.threshold)
+    log.info(f"Input file:            {args.input}")
+    log.info(f"Output file:           {args.output}")
+    log.info(f"Reference file:        {args.reference}")
+    log.info(f"Distance threshold:    {args.threshold}")
     log.info(thin)
-    log.info("Total reads (with BC): %d", STATS["total_reads_with_bc"])
-    log.info("Total reads corrected: %d", STATS["total_corrected_reads"])
+    log.info(f"Total reads (with BC): {STATS['total_reads_with_bc']:,}")
+    log.info(f"Total reads corrected: {STATS['total_corrected_reads']:,}")
 
     if STATS["total_reads_with_bc"] > 0:
         pct = (STATS["total_corrected_reads"] / STATS["total_reads_with_bc"]) * 100
-        log.info("Correction rate:       %.2f%%", pct)
+        log.info(f"Correction rate:       {pct:.2f}%")
 
     log.info(thin)
-    log.info("Unique BCs (before):   %d", len(STATS["unique_bcs_before"]))
-    log.info("Unique BCs (after):    %d", len(STATS["unique_bcs_after"]))
+    log.info(f"Unique BCs (before):   {len(STATS['unique_bcs_before']):,}")
+    log.info(f"Unique BCs (after):    {len(STATS['unique_bcs_after']):,}")
     collapsed = len(STATS["unique_bcs_before"]) - len(STATS["unique_bcs_after"])
-    log.info("Unique BCs collapsed:  %d", collapsed)
+    log.info(f"Unique BCs collapsed:  {collapsed:,}")
+    log.info(thin)
+    log.info(f"Genes skipped (ambiguous, uncorrectable): {STATS['genes_skipped']:,}")
     log.info(divider)
 
 

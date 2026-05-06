@@ -1,3 +1,22 @@
+"""
+Strategy
+--------
+Reads in a barcode-sorted BAM of ONT reads aligned to Gencode cDNA sequences.
+For each barcode (representing a library member), the script:
+
+1. Groups reads by their BC tag and skips groups below MIN_READS.
+2. Identifies the primary isoform — the reference transcript that the majority
+   of reads in the group align to.
+3. Computes a confidence score: the fraction of reads supporting that isoform.
+4. Generates a pileup consensus from reads aligned to the primary isoform,
+   recovering up to 10 bp of soft-clipped sequence on each end so that bases
+   extending beyond the annotated transcript boundaries are not lost.
+5. Fetches the matching Gencode cDNA sequence from the reference FASTA for
+   direct comparison.
+6. Writes one row per barcode to a CSV with the consensus, original cDNA,
+   confidence score, and read counts.
+"""
+
 import argparse
 import pandas as pd
 import tqdm
