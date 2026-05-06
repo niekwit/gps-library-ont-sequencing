@@ -5,19 +5,36 @@ For reads grouped by gene name (6th field of RNAME split by "|"):
 
 1. Collect unique BC tag sequences from all reads in the group.
 2. Compute pairwise Levenshtein distances across all barcode combinations.
-3. If any pair falls within --threshold, those barcodes are "ambiguous" and
-   need adjudication against a reference barcode set.
-4. Fetch the reference barcodes for that gene from the supplied CSV.
-5. For each ambiguous barcode, find the nearest reference barcode. If one is
-   within --threshold, update the BC tag on every affected read to that
-   reference sequence. Ties are broken by choosing the lower distance; if
-   distances are equal the first reference barcode wins.
-6. All reads (corrected or not) are written to the output BAM. Corrected reads
-   also receive an OB tag (original barcode) and XB flag set to True.
+3. If any pair falls within --threshold, those barcodes are flagged as
+   "ambiguous" and enter the four-stage resolution pipeline below.
+
+Resolution pipeline (each stage only runs if the previous produced no corrections):
+
+  a. CSV lookup — fetch known barcodes for the gene from the reference CSV and
+     run build_correction_map. Each ambiguous barcode is replaced by the nearest
+     reference barcode within --threshold. Ties resolved by lowest distance;
+     equal distances resolved by order of appearance in the CSV.
+
+  b. Alias lookup — if the CSV lookup found no reference barcodes, query
+     MyGene.info with the Ensembl gene ID (field 2 of RNAME, version stripped)
+     to obtain alternative gene names. Each alias is checked against the
+     reference CSV; the first hit is used as the reference set.
+
+  c. Length-based fallback — if stages (a) and (b) produced no corrections,
+     inspect the ambiguous barcodes themselves. If exactly one has a length of
+     24 or 30 bp (the expected library barcode lengths), treat it as an internal
+     anchor and attempt correction of the remaining ambiguous barcodes against it.
+
+  d. Skip — if all three stages fail, log a WARNING and leave the reads unchanged.
+
+4. All reads (corrected or not) are written to the output BAM. Corrected reads
+   receive an updated BC tag, an OB tag preserving the original barcode, and
+   XB=True. Uncorrected reads receive XB=False.
 """
 
 import argparse
 import logging
+import mygene
 import pysam
 import pandas as pd
 from itertools import combinations
@@ -95,6 +112,12 @@ _console_handler.setFormatter(_fmt)
 logging.basicConfig(level=logging.DEBUG, handlers=[_file_handler, _console_handler])
 log = logging.getLogger(__name__)
 
+# Silence the HTTP client libraries used internally by mygene so their
+# connection/request details don't flood the log file.
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("mygene").setLevel(logging.WARNING)
+
 # ---------------------------------------------------------------------------
 # Global metrics — accumulated across all gene groups and reported at the end
 # ---------------------------------------------------------------------------
@@ -104,7 +127,54 @@ STATS = {
     "unique_bcs_before": set(),  # all unique BC values seen before correction
     "unique_bcs_after": set(),  # all unique BC values written to the output
     "genes_skipped": 0,  # genes with ambiguous barcodes that could not be corrected
+    "genes_alias_resolved": 0,  # genes resolved via Ensembl alias lookup
 }
+
+# ---------------------------------------------------------------------------
+# Ensembl alias lookup — used when a gene name is absent from the reference CSV
+# ---------------------------------------------------------------------------
+_mg = mygene.MyGeneInfo()
+_alias_cache: dict[str, list[str]] = {}  # ENSG ID (no version) -> aliases
+
+
+def extract_ensg_id(rname):
+    """Returns the versionless ENSG ID from a Gencode RNAME (2nd |-separated field)."""
+    if not rname:
+        return None
+    parts = rname.split("|")
+    if len(parts) < 2:
+        return None
+    # Strip the version suffix (e.g. ENSG00000179218.12 -> ENSG00000179218)
+    return parts[1].split(".")[0]
+
+
+def get_aliases(ensg_id):
+    """Returns all known gene name aliases for an Ensembl gene ID via MyGene.info.
+
+    Results are cached so each ENSG ID is only queried once per run.
+    Returns an empty list if the query fails or the gene has no aliases.
+    """
+    if ensg_id in _alias_cache:
+        return _alias_cache[ensg_id]
+
+    try:
+        result = _mg.getgene(
+            ensg_id, fields=["alias", "symbol"], species="human", verbose=False
+        )
+        aliases = []
+        if result:
+            raw = result.get("alias", [])
+            # mygene returns a str when there is only one alias, list otherwise
+            aliases = [raw] if isinstance(raw, str) else list(raw)
+            symbol = result.get("symbol")
+            if symbol and symbol not in aliases:
+                aliases.append(symbol)
+    except Exception as e:
+        log.debug(f"MyGene.info lookup failed for {ensg_id}: {e}")
+        aliases = []
+
+    _alias_cache[ensg_id] = aliases
+    return aliases
 
 
 def reverse_complement(seq):
@@ -213,30 +283,65 @@ def process_group(reads, writer, ref_by_gene):
             # anchor to decide which of the two close sequences is correct.
             ref_bcs = ref_by_gene.get(gene, [])
 
+            if ref_bcs:
+                log.debug(f"Gene {gene}: found {len(ref_bcs)} reference barcode(s) in CSV")
+
             if not ref_bcs:
-                # Fallback: if exactly one of the ambiguous barcodes has the
-                # expected length (24 or 30), it is almost certainly the true
-                # sequence — use it as a synthetic single-barcode reference.
-                target_len_bcs = [bc for bc in ambiguous if len(bc) in (24, 30)]
-                if len(target_len_bcs) == 1:
-                    log.debug(
-                        f"Gene {gene}: no CSV reference found; using length-"
-                        f"{len(target_len_bcs[0])} barcode {target_len_bcs[0]} "
-                        f"as fallback anchor."
-                    )
-                    ref_bcs = target_len_bcs
-                else:
-                    STATS["genes_skipped"] += 1
-                    log.warning(
-                        f"Gene {gene} has {len(close_pairs)} ambiguous barcode "
-                        f"pair(s) but no reference barcodes and no unambiguous "
-                        f"length-24/30 anchor — skipping correction for this gene."
-                    )
+                # Alias fallback: the reference CSV may use an older name for
+                # this gene. Query MyGene.info with the Ensembl gene ID and
+                # check whether any alias matches an entry in the reference.
+                ensg_id = extract_ensg_id(reads[0].reference_name)
+                if ensg_id:
+                    for alias in get_aliases(ensg_id):
+                        ref_bcs = ref_by_gene.get(alias, [])
+                        if ref_bcs:
+                            log.debug(
+                                f"Gene {gene}: found reference barcodes under "
+                                f"alias '{alias}' ({ensg_id})"
+                            )
+                            STATS["genes_alias_resolved"] += 1
+                            break
 
             if ref_bcs:
                 correction_map = build_correction_map(
                     ambiguous, ref_bcs, args.threshold
                 )
+                if correction_map:
+                    log.debug(f"Gene {gene}: {len(correction_map)} barcode(s) will be corrected")
+                else:
+                    log.debug(f"Gene {gene}: no ambiguous barcodes matched a reference within threshold")
+
+            if not correction_map:
+                # Length fallback: applies whenever CSV/alias refs either didn't
+                # exist or existed but produced no corrections within threshold.
+                # If exactly one ambiguous barcode has the expected length (24 or
+                # 30), use it as an internal anchor to correct the others.
+                target_len_bcs = [bc for bc in ambiguous if len(bc) in (24, 30)]
+                if len(target_len_bcs) == 1:
+                    log.debug(
+                        f"Gene {gene}: using length-{len(target_len_bcs[0])} "
+                        f"barcode {target_len_bcs[0]} as length-based fallback anchor."
+                    )
+                    correction_map = build_correction_map(
+                        ambiguous, target_len_bcs, args.threshold
+                    )
+                    if correction_map:
+                        log.debug(
+                            f"Gene {gene}: {len(correction_map)} barcode(s) corrected "
+                            f"via length-based fallback"
+                        )
+                    else:
+                        log.debug(
+                            f"Gene {gene}: length-based anchor produced no corrections within threshold"
+                        )
+                else:
+                    STATS["genes_skipped"] += 1
+                    log.warning(
+                        f"Gene {gene} has {len(close_pairs)} ambiguous barcode "
+                        f"pair(s) but no reference barcodes (CSV and alias lookup "
+                        f"both failed) and no unambiguous length-24/30 anchor — "
+                        f"skipping correction for this gene."
+                    )
 
     # Step 4: apply corrections and write every read to the output BAM.
     for read in reads_with_bc:
@@ -350,6 +455,9 @@ def main():
     collapsed = len(STATS["unique_bcs_before"]) - len(STATS["unique_bcs_after"])
     log.info(f"Unique BCs collapsed:  {collapsed:,}")
     log.info(thin)
+    log.info(
+        f"Genes resolved via alias lookup:          {STATS['genes_alias_resolved']:,}"
+    )
     log.info(f"Genes skipped (ambiguous, uncorrectable): {STATS['genes_skipped']:,}")
     log.info(divider)
 
