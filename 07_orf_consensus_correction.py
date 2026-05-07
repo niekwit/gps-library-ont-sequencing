@@ -23,11 +23,16 @@ Strategy
    d. If exactly one ground-truth candidate exists within the component,
       replace every other sequence in that component with the ground truth
       and mark those rows as corrected (orf_corrected = True).
-   e. If multiple ground-truth candidates are found, use read support as a
-      tiebreaker: the candidate with the most rows in the gene group is
-      chosen.  If two candidates share the exact same row count the
-      component is skipped and a warning is logged.
-   f. If zero ground-truth candidates are found, skip the component and log
+   e. If multiple ground-truth candidates are found, use barcode count as a
+      tiebreaker: the candidate supported by the most barcodes (rows) in
+      the gene group is chosen.
+   f. If the top candidates are still tied on barcode count, build an IUPAC
+      nucleotide consensus of the tied sequences: mismatching positions are
+      encoded with the appropriate IUPAC ambiguity code (e.g. R for A/G,
+      Y for C/T) rather than N.  All sequences in the component are then
+      corrected to this consensus.  If the tied sequences differ in length
+      (indels), the component is skipped and a warning is logged.
+   g. If zero ground-truth candidates are found, skip the component and log
       a warning.
 5. Write the corrected DataFrame to a new CSV with an added orf_corrected
    boolean column.
@@ -104,10 +109,44 @@ log = logging.getLogger(__name__)
 LINKER_ORF81 = "CCAACTTTCTTGTACAAAGTGGTTTAA"
 STOP_CODONS = {"TAA", "TAG", "TGA"}
 
+# IUPAC ambiguity codes for all possible subsets of {A, C, G, T}.
+# frozenset is used as the key type because it is an immutable, order-independent
+# set — frozenset("AG") and frozenset("GA") are identical keys, so the lookup
+# works regardless of the order in which bases are encountered at a position.
+_IUPAC_MAP: dict[frozenset, str] = {
+    frozenset("A"): "A",
+    frozenset("C"): "C",
+    frozenset("G"): "G",
+    frozenset("T"): "T",
+    frozenset("AG"): "R",
+    frozenset("CT"): "Y",
+    frozenset("CG"): "S",
+    frozenset("AT"): "W",
+    frozenset("GT"): "K",
+    frozenset("AC"): "M",
+    frozenset("CGT"): "B",
+    frozenset("AGT"): "D",
+    frozenset("ACT"): "H",
+    frozenset("ACG"): "V",
+    frozenset("ACGT"): "N",
+}
+
 
 # ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
+
+
+def compute_iupac_consensus(seqs: list[str]) -> str | None:
+    """Returns an IUPAC consensus of same-length sequences, or None if lengths differ."""
+    lengths = {len(s) for s in seqs}
+    if len(lengths) > 1:
+        return None
+    result = []
+    for i in range(lengths.pop()):
+        bases = frozenset(s[i].upper() for s in seqs)
+        result.append(_IUPAC_MAP.get(bases, "N"))
+    return "".join(result)
 
 
 def is_valid_orf(seq: str) -> bool:
@@ -211,6 +250,7 @@ def process():
         "components_no_truth": 0,
         "components_multi_truth": 0,
         "components_multi_truth_resolved": 0,
+        "components_iupac_resolved": 0,
         "rows_corrected": 0,
     }
 
@@ -266,12 +306,24 @@ def process():
                 top = seq_counts.get(valid_orfs_sorted[0], 0)
                 second = seq_counts.get(valid_orfs_sorted[1], 0)
                 if top == second:
-                    stats["components_multi_truth"] += 1
-                    log.warning(
-                        f"Gene {gene_name}: {len(valid_orfs)} valid ORF candidates tied "
-                        f"on barcode count — skipping. Candidates: {valid_orfs}"
+                    # Barcode count is tied — collapse all tied candidates to an
+                    # IUPAC consensus so the component is not simply discarded
+                    tied_orfs = [s for s in valid_orfs_sorted if seq_counts.get(s, 0) == top]
+                    iupac_gt = compute_iupac_consensus(tied_orfs)
+                    if iupac_gt is None:
+                        stats["components_multi_truth"] += 1
+                        log.warning(
+                            f"Gene {gene_name}: {len(tied_orfs)} tied valid ORF candidates "
+                            f"differ in length — cannot build IUPAC consensus, skipping."
+                        )
+                        continue
+                    n_ambig = sum(1 for c in iupac_gt if c not in "ACGT")
+                    stats["components_iupac_resolved"] += 1
+                    log.debug(
+                        f"Gene {gene_name}: {len(tied_orfs)} tied valid ORF candidates "
+                        f"collapsed to IUPAC consensus ({n_ambig} ambiguous position(s))"
                     )
-                    continue
+                    valid_orfs = [iupac_gt]
                 stats["components_multi_truth_resolved"] += 1
                 gt_preview = valid_orfs_sorted[0]
                 log.debug(
@@ -325,8 +377,9 @@ def process():
     log.info(f"ORF clusters found:                         {stats['components_found']:,}")
     log.info(f"ORF clusters corrected:                     {stats['components_corrected']:,}")
     log.info(f"ORF clusters — no valid ORF:                {stats['components_no_truth']:,}")
-    log.info(f"ORF clusters — ambiguous (resolved by BC):  {stats['components_multi_truth_resolved']:,}")
-    log.info(f"ORF clusters — ambiguous (tied, skipped):   {stats['components_multi_truth']:,}")
+    log.info(f"ORF clusters — ambiguous (resolved by BC):     {stats['components_multi_truth_resolved']:,}")
+    log.info(f"ORF clusters — ambiguous (resolved by IUPAC): {stats['components_iupac_resolved']:,}")
+    log.info(f"ORF clusters — ambiguous (tied, skipped):     {stats['components_multi_truth']:,}")
     log.info(divider)
 
 
