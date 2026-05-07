@@ -55,6 +55,20 @@ MIN_READS = args.min_reads
 OUTPUT_CSV = args.output
 
 
+def extract_cds(header, seq):
+    """Returns the CDS subsequence using coordinates from the Gencode header.
+
+    Gencode headers contain a field like 'CDS:71-2188' with 1-based inclusive
+    coordinates. Returns the full sequence unchanged if no CDS field is found.
+    """
+    for field in header.split("|"):
+        if field.startswith("CDS:"):
+            start, end = field[4:].split("-")
+            # Convert from 1-based inclusive to 0-based Python slice
+            return seq[int(start) - 1 : int(end)]
+    return seq
+
+
 def get_bc_tag(read):
     """Retrieves the BC tag from a pysam AlignedSegment."""
     return read.get_tag("BC") if read.has_tag("BC") else None
@@ -168,9 +182,9 @@ def process_to_csv():
             header_parts = full_header.split("|")
             short_name = header_parts[5] if len(header_parts) >= 6 else "Unknown"
 
-            # Fetch GenCode cDNA sequence (from FASTA)
+            # Fetch GenCode cDNA sequence and trim to CDS only
             try:
-                original_cdna = ref_seqs.fetch(full_header)
+                original_cdna = extract_cds(full_header, ref_seqs.fetch(full_header))
             except KeyError:
                 original_cdna = "REF_NOT_FOUND"
 
