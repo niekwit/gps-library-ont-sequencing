@@ -322,11 +322,11 @@ def process():
     log.info(f"Total rows:                   {len(df):,}")
     log.info(f"Rows corrected:               {stats['rows_corrected']:,}")
     log.info(thin)
-    log.info(f"Components found:                         {stats['components_found']:,}")
-    log.info(f"Components corrected:                     {stats['components_corrected']:,}")
-    log.info(f"Components — no valid ORF:                {stats['components_no_truth']:,}")
-    log.info(f"Components — ambiguous (resolved by BC):  {stats['components_multi_truth_resolved']:,}")
-    log.info(f"Components — ambiguous (tied, skipped):   {stats['components_multi_truth']:,}")
+    log.info(f"ORF clusters found:                         {stats['components_found']:,}")
+    log.info(f"ORF clusters corrected:                     {stats['components_corrected']:,}")
+    log.info(f"ORF clusters — no valid ORF:                {stats['components_no_truth']:,}")
+    log.info(f"ORF clusters — ambiguous (resolved by BC):  {stats['components_multi_truth_resolved']:,}")
+    log.info(f"ORF clusters — ambiguous (tied, skipped):   {stats['components_multi_truth']:,}")
     log.info(divider)
 
 
