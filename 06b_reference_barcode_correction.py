@@ -5,29 +5,36 @@ For reads grouped by gene name (6th field of RNAME split by "|"):
 
 1. Collect unique BC tag sequences from all reads in the group.
 2. Compute pairwise Levenshtein distances across all barcode combinations.
-3. If any pair falls within --threshold, those barcodes are flagged as
-   "ambiguous" and enter the four-stage resolution pipeline below.
+3. If any pairs fall within --threshold, build a graph where barcodes are nodes
+   and close pairs are edges, then partition it into connected components. Each
+   component is an independent cluster of similar barcodes and is resolved
+   separately, preventing unrelated pairs from being lumped together.
+4. Reference barcodes are fetched once per gene (not per component) via:
+     - Direct CSV lookup by gene name.
+     - Alias lookup via MyGene.info (using the Ensembl gene ID from field 2 of
+       RNAME) if the gene name is absent from the CSV — handles outdated names.
+5. Each component is passed through the resolution pipeline below in order;
+   each stage only runs if the previous produced no corrections.
 
-Resolution pipeline (each stage only runs if the previous produced no corrections):
+Resolution pipeline (per component):
 
-  a. CSV lookup — fetch known barcodes for the gene from the reference CSV and
-     run build_correction_map. Each ambiguous barcode is replaced by the nearest
-     reference barcode within --threshold. Ties resolved by lowest distance;
-     equal distances resolved by order of appearance in the CSV.
+  a. Reference correction — compare each barcode in the component against the
+     gene's reference barcodes. Replace with the nearest reference barcode
+     within --threshold. Ties broken by lowest distance, then CSV order.
 
-  b. Alias lookup — if the CSV lookup found no reference barcodes, query
-     MyGene.info with the Ensembl gene ID (field 2 of RNAME, version stripped)
-     to obtain alternative gene names. Each alias is checked against the
-     reference CSV; the first hit is used as the reference set.
+  b. Length-based fallback — if exactly one barcode in the component has the
+     expected length (24 or 30 bp), treat it as an internal anchor and correct
+     the others against it.
 
-  c. Length-based fallback — if stages (a) and (b) produced no corrections,
-     inspect the ambiguous barcodes themselves. If exactly one has a length of
-     24 or 30 bp (the expected library barcode lengths), treat it as an internal
-     anchor and attempt correction of the remaining ambiguous barcodes against it.
+  c. N-consensus — if no anchor can be identified, compute a position-wise
+     consensus where differing bases become N. Only applied when all barcodes
+     share the same length and the number of N positions does not exceed
+     --threshold (more Ns would indicate unrelated barcodes grouped
+     transitively, producing a meaningless consensus).
 
-  d. Skip — if all three stages fail, log a WARNING and leave the reads unchanged.
+  d. Skip — if all three stages fail, log a WARNING and leave reads unchanged.
 
-4. All reads (corrected or not) are written to the output BAM. Corrected reads
+6. All reads (corrected or not) are written to the output BAM. Corrected reads
    receive an updated BC tag, an OB tag preserving the original barcode, and
    XB=True. Uncorrected reads receive XB=False.
 """
@@ -126,8 +133,9 @@ STATS = {
     "total_corrected_reads": 0,
     "unique_bcs_before": set(),  # all unique BC values seen before correction
     "unique_bcs_after": set(),  # all unique BC values written to the output
-    "genes_skipped": 0,  # genes with ambiguous barcodes that could not be corrected
-    "genes_alias_resolved": 0,  # genes resolved via Ensembl alias lookup
+    "genes_skipped": 0,          # genes with ambiguous barcodes that could not be corrected
+    "genes_alias_resolved": 0,   # genes resolved via Ensembl alias lookup
+    "genes_n_consensus": 0,      # genes collapsed to an N-masked consensus
 }
 
 # ---------------------------------------------------------------------------
@@ -177,6 +185,22 @@ def get_aliases(ensg_id):
     return aliases
 
 
+def compute_n_consensus(barcodes):
+    """Returns a consensus where every position that differs across barcodes is N.
+
+    Requires all barcodes to have the same length — returns None otherwise,
+    since insertions/deletions make column-wise comparison undefined.
+    """
+    lengths = {len(bc) for bc in barcodes}
+    if len(lengths) > 1:
+        return None
+    result = []
+    for i in range(lengths.pop()):
+        bases = {bc[i] for bc in barcodes}
+        result.append(bases.pop() if len(bases) == 1 else "N")
+    return "".join(result)
+
+
 def reverse_complement(seq):
     """Returns the reverse complement of a DNA sequence using Biopython."""
     return str(Seq(seq).reverse_complement())
@@ -204,6 +228,37 @@ def find_close_pairs(barcodes, threshold):
         if d <= threshold:
             result.append((bc1, bc2, d))
     return result
+
+
+def connected_components(pairs):
+    """Returns a list of sets, each being a connected component of the pair graph.
+
+    Barcodes are nodes; a pair within the Levenshtein threshold is an edge.
+    Components that are only transitively connected (A-B and C-D with no link
+    between them) are returned as separate sets so they can be resolved
+    independently rather than lumped into one ambiguous pool.
+    """
+    graph = {}
+    for bc1, bc2, _ in pairs:
+        graph.setdefault(bc1, set()).add(bc2)
+        graph.setdefault(bc2, set()).add(bc1)
+
+    visited = set()
+    components = []
+    for start in graph:
+        if start in visited:
+            continue
+        component = set()
+        queue = [start]
+        while queue:
+            node = queue.pop()
+            if node in visited:
+                continue
+            visited.add(node)
+            component.add(node)
+            queue.extend(graph[node] - visited)
+        components.append(component)
+    return components
 
 
 def build_correction_map(ambiguous_bcs, ref_bcs, threshold):
@@ -269,20 +324,20 @@ def process_group(reads, writer, ref_by_gene):
         if close_pairs:
             gene = extract_gene_name(reads[0].reference_name)
             log.debug(f"Gene {gene}: {len(close_pairs)} close barcode pair(s) found")
+            for bc1, bc2, dist in close_pairs:
+                log.debug(f"  {bc1} <-> {bc2}  (distance {dist})")
 
-            # Step 2: collect the full set of ambiguous barcodes (both members
-            # of every close pair) — needed for both the reference lookup and
-            # the length-based fallback below.
-            ambiguous = set()
-            for bc1, bc2, _ in close_pairs:
-                ambiguous.add(bc1)
-                ambiguous.add(bc2)
+            # Step 2: split close pairs into connected components so that
+            # independent clusters (e.g. (A,B) and (C,D) with no link between
+            # them) are resolved separately rather than lumped into one pool.
+            components = connected_components(close_pairs)
+            if len(components) > 1:
+                log.debug(f"Gene {gene}: {len(components)} independent barcode cluster(s)")
 
-            # Step 3: look up the known ("ground truth") barcodes for this
-            # gene from the reference CSV. Without a reference we have no
-            # anchor to decide which of the two close sequences is correct.
+            # Step 3: look up reference barcodes once for the whole gene —
+            # the CSV and alias lookups depend only on the gene name, not on
+            # which specific barcodes are in each component.
             ref_bcs = ref_by_gene.get(gene, [])
-
             if ref_bcs:
                 log.debug(f"Gene {gene}: found {len(ref_bcs)} reference barcode(s) in CSV")
 
@@ -302,46 +357,77 @@ def process_group(reads, writer, ref_by_gene):
                             STATS["genes_alias_resolved"] += 1
                             break
 
-            if ref_bcs:
-                correction_map = build_correction_map(
-                    ambiguous, ref_bcs, args.threshold
-                )
-                if correction_map:
-                    log.debug(f"Gene {gene}: {len(correction_map)} barcode(s) will be corrected")
-                else:
-                    log.debug(f"Gene {gene}: no ambiguous barcodes matched a reference within threshold")
+            # Step 4: resolve each component independently.
+            for component in components:
+                component_map = {}
 
-            if not correction_map:
-                # Length fallback: applies whenever CSV/alias refs either didn't
-                # exist or existed but produced no corrections within threshold.
-                # If exactly one ambiguous barcode has the expected length (24 or
-                # 30), use it as an internal anchor to correct the others.
-                target_len_bcs = [bc for bc in ambiguous if len(bc) in (24, 30)]
-                if len(target_len_bcs) == 1:
-                    log.debug(
-                        f"Gene {gene}: using length-{len(target_len_bcs[0])} "
-                        f"barcode {target_len_bcs[0]} as length-based fallback anchor."
+                if ref_bcs:
+                    component_map = build_correction_map(
+                        component, ref_bcs, args.threshold
                     )
-                    correction_map = build_correction_map(
-                        ambiguous, target_len_bcs, args.threshold
-                    )
-                    if correction_map:
+                    if component_map:
                         log.debug(
-                            f"Gene {gene}: {len(correction_map)} barcode(s) corrected "
-                            f"via length-based fallback"
+                            f"Gene {gene}: {len(component_map)} barcode(s) corrected "
+                            f"from reference"
                         )
                     else:
                         log.debug(
-                            f"Gene {gene}: length-based anchor produced no corrections within threshold"
+                            f"Gene {gene}: no barcodes in cluster matched a reference "
+                            f"within threshold"
                         )
-                else:
-                    STATS["genes_skipped"] += 1
-                    log.warning(
-                        f"Gene {gene} has {len(close_pairs)} ambiguous barcode "
-                        f"pair(s) but no reference barcodes (CSV and alias lookup "
-                        f"both failed) and no unambiguous length-24/30 anchor — "
-                        f"skipping correction for this gene."
-                    )
+
+                if not component_map:
+                    # Length fallback: if exactly one barcode in the component
+                    # has the expected length (24 or 30), use it as an anchor.
+                    target_len_bcs = [bc for bc in component if len(bc) in (24, 30)]
+                    if len(target_len_bcs) == 1:
+                        log.debug(
+                            f"Gene {gene}: using length-{len(target_len_bcs[0])} "
+                            f"barcode {target_len_bcs[0]} as length-based fallback anchor."
+                        )
+                        component_map = build_correction_map(
+                            component, target_len_bcs, args.threshold
+                        )
+                        if component_map:
+                            log.debug(
+                                f"Gene {gene}: {len(component_map)} barcode(s) corrected "
+                                f"via length-based fallback"
+                            )
+                        else:
+                            log.debug(
+                                f"Gene {gene}: length-based anchor produced no corrections "
+                                f"within threshold"
+                            )
+                    else:
+                        # N-consensus fallback: collapse the component to a
+                        # consensus where differing positions become N. Only
+                        # valid when all barcodes share the same length and the
+                        # total number of differing positions is within threshold.
+                        consensus = compute_n_consensus(component)
+                        n_count = consensus.count("N") if consensus else None
+                        if consensus and n_count <= args.threshold:
+                            log.debug(
+                                f"Gene {gene}: collapsing {len(component)} barcodes to "
+                                f"N-consensus ({n_count} ambiguous position(s)): {consensus}"
+                            )
+                            STATS["genes_n_consensus"] += 1
+                            component_map = {
+                                bc: consensus for bc in component if bc != consensus
+                            }
+                        else:
+                            STATS["genes_skipped"] += 1
+                            reason = (
+                                f"mixed-length barcodes preventing N-consensus"
+                                if not consensus
+                                else f"N-consensus has {n_count} ambiguous positions "
+                                     f"(>{args.threshold})"
+                            )
+                            log.warning(
+                                f"Gene {gene}: cluster of {len(component)} barcodes "
+                                f"could not be corrected — {reason}."
+                            )
+
+                correction_map.update(component_map)
 
     # Step 4: apply corrections and write every read to the output BAM.
     for read in reads_with_bc:
@@ -455,9 +541,8 @@ def main():
     collapsed = len(STATS["unique_bcs_before"]) - len(STATS["unique_bcs_after"])
     log.info(f"Unique BCs collapsed:  {collapsed:,}")
     log.info(thin)
-    log.info(
-        f"Genes resolved via alias lookup:          {STATS['genes_alias_resolved']:,}"
-    )
+    log.info(f"Genes resolved via alias lookup:          {STATS['genes_alias_resolved']:,}")
+    log.info(f"Genes collapsed to N-consensus:           {STATS['genes_n_consensus']:,}")
     log.info(f"Genes skipped (ambiguous, uncorrectable): {STATS['genes_skipped']:,}")
     log.info(divider)
 
