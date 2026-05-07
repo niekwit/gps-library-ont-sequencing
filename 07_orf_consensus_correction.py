@@ -23,8 +23,12 @@ Strategy
    d. If exactly one ground-truth candidate exists within the component,
       replace every other sequence in that component with the ground truth
       and mark those rows as corrected (orf_corrected = True).
-   e. If zero or multiple ground-truth candidates are found, skip the
-      component and log a warning.
+   e. If multiple ground-truth candidates are found, use read support as a
+      tiebreaker: the candidate with the most rows in the gene group is
+      chosen.  If two candidates share the exact same row count the
+      component is skipped and a warning is logged.
+   f. If zero ground-truth candidates are found, skip the component and log
+      a warning.
 5. Write the corrected DataFrame to a new CSV with an added orf_corrected
    boolean column.
 """
@@ -32,9 +36,9 @@ Strategy
 import argparse
 import logging
 from collections import defaultdict
-from itertools import combinations
 
 import pandas as pd
+import tqdm
 from rapidfuzz.distance import Levenshtein
 
 # ---------------------------------------------------------------------------
@@ -44,7 +48,10 @@ parser = argparse.ArgumentParser(
     description="Correct ORF consensus sequences using Levenshtein distance and ORF validity."
 )
 parser.add_argument(
-    "-i", "--input", required=True, help="Input CSV file (output of 07_orf_consensus.py)"
+    "-i",
+    "--input",
+    required=True,
+    help="Input CSV file (output of 07_orf_consensus.py)",
 )
 parser.add_argument(
     "-o",
@@ -56,8 +63,8 @@ parser.add_argument(
     "-t",
     "--threshold",
     type=int,
-    default=5,
-    help="Maximum Levenshtein distance to consider two sequences as related (default: 5)",
+    default=2,
+    help="Maximum Levenshtein distance to consider two sequences as related (default: 2)",
 )
 parser.add_argument(
     "--log-file",
@@ -118,12 +125,24 @@ def is_valid_orf(seq: str) -> bool:
 
 
 def find_close_pairs(seqs: list[str], threshold: int) -> list[tuple[str, str, int]]:
-    """Returns all (seq_a, seq_b, distance) pairs with distance ≤ threshold."""
+    """Returns all (seq_a, seq_b, distance) pairs with distance ≤ threshold.
+
+    Sequences are sorted by length so the inner loop can break early: once the
+    length difference alone exceeds the threshold, Levenshtein distance is
+    guaranteed to exceed it too, so all remaining comparisons can be skipped.
+    """
     pairs = []
-    for a, b in combinations(seqs, 2):
-        dist = Levenshtein.distance(a, b, score_cutoff=threshold)
-        if dist <= threshold:
-            pairs.append((a, b, dist))
+    sorted_seqs = sorted(seqs, key=len)
+    n = len(sorted_seqs)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if len(sorted_seqs[j]) - len(sorted_seqs[i]) > threshold:
+                break
+            dist = Levenshtein.distance(
+                sorted_seqs[i], sorted_seqs[j], score_cutoff=threshold
+            )
+            if dist <= threshold:
+                pairs.append((sorted_seqs[i], sorted_seqs[j], dist))
     return pairs
 
 
@@ -191,10 +210,19 @@ def process():
         "components_corrected": 0,
         "components_no_truth": 0,
         "components_multi_truth": 0,
+        "components_multi_truth_resolved": 0,
         "rows_corrected": 0,
     }
 
-    for gene_name, group in df.groupby("gene_name"):
+    # Collect all corrections during the read-only loop pass; apply after.
+    # Modifying df inside a groupby iteration triggers pandas CoW invalidation
+    # on every write, which causes O(n_genes * n_rows) overhead.
+    all_corrections: dict[int, str] = {}  # DataFrame row index → corrected sequence
+
+    n_genes = df["gene_name"].nunique()
+    for gene_name, group in tqdm.tqdm(
+        df.groupby("gene_name"), total=n_genes, desc="Processing genes"
+    ):
         unique_seqs = group["consensus_cdna"].dropna().unique().tolist()
 
         if len(unique_seqs) < 2:
@@ -213,6 +241,8 @@ def process():
         )
         stats["components_found"] += len(components)
 
+        correction_map: dict[str, str] = {}
+
         for comp in components:
             if len(comp) < 2:
                 continue
@@ -228,31 +258,52 @@ def process():
                 continue
 
             if len(valid_orfs) > 1:
-                stats["components_multi_truth"] += 1
-                log.warning(
-                    f"Gene {gene_name}: component with {len(comp)} sequence(s) has "
-                    f"{len(valid_orfs)} valid ORF candidates — ambiguous, skipping. "
-                    f"Candidates: {valid_orfs}"
+                # Tiebreaker: pick the valid ORF with the most rows in this group
+                seq_counts = group["consensus_cdna"].value_counts()
+                valid_orfs_sorted = sorted(
+                    valid_orfs, key=lambda s: seq_counts.get(s, 0), reverse=True
                 )
-                continue
+                top = seq_counts.get(valid_orfs_sorted[0], 0)
+                second = seq_counts.get(valid_orfs_sorted[1], 0)
+                if top == second:
+                    stats["components_multi_truth"] += 1
+                    log.warning(
+                        f"Gene {gene_name}: {len(valid_orfs)} valid ORF candidates tied "
+                        f"on barcode count — skipping. Candidates: {valid_orfs}"
+                    )
+                    continue
+                stats["components_multi_truth_resolved"] += 1
+                gt_preview = valid_orfs_sorted[0]
+                log.debug(
+                    f"Gene {gene_name}: {len(valid_orfs)} valid ORF candidates resolved "
+                    f"by barcode count ({top} vs {second}) — "
+                    f"chose '{gt_preview[:40]}{'...' if len(gt_preview) > 40 else ''}'"
+                )
+                valid_orfs = [valid_orfs_sorted[0]]
 
             ground_truth = valid_orfs[0]
-            to_correct = comp - {ground_truth}
+            for seq in comp - {ground_truth}:
+                correction_map[seq] = ground_truth
 
             log.debug(
-                f"Gene {gene_name}: correcting {len(to_correct)} sequence(s) → "
+                f"Gene {gene_name}: correcting {len(comp) - 1} sequence(s) → "
                 f"ground truth '{ground_truth[:40]}{'...' if len(ground_truth) > 40 else ''}'"
             )
-
-            # Apply correction to all matching rows in this gene's group
-            mask = (df["gene_name"] == gene_name) & (df["consensus_cdna"].isin(to_correct))
-            n_corrected = mask.sum()
-            df.loc[mask, "consensus_cdna"] = ground_truth
-            df.loc[mask, "consensus_length"] = len(ground_truth)
-            df.loc[mask, "orf_corrected"] = True
-
             stats["components_corrected"] += 1
-            stats["rows_corrected"] += n_corrected
+
+        if correction_map:
+            for row_idx, old_seq in group["consensus_cdna"].items():
+                if old_seq in correction_map:
+                    all_corrections[row_idx] = correction_map[old_seq]
+
+    # Apply all corrections in one batch — no per-gene DataFrame writes
+    if all_corrections:
+        idx = list(all_corrections.keys())
+        new_seqs = [all_corrections[i] for i in idx]
+        df.loc[idx, "consensus_cdna"] = new_seqs
+        df.loc[idx, "consensus_length"] = [len(s) for s in new_seqs]
+        df.loc[idx, "orf_corrected"] = True
+        stats["rows_corrected"] = len(idx)
 
     # ------------------------------------------------------------------
     # Write output
@@ -271,10 +322,11 @@ def process():
     log.info(f"Total rows:                   {len(df):,}")
     log.info(f"Rows corrected:               {stats['rows_corrected']:,}")
     log.info(thin)
-    log.info(f"Components found:             {stats['components_found']:,}")
-    log.info(f"Components corrected:         {stats['components_corrected']:,}")
-    log.info(f"Components — no valid ORF:    {stats['components_no_truth']:,}")
-    log.info(f"Components — ambiguous ORF:   {stats['components_multi_truth']:,}")
+    log.info(f"Components found:                         {stats['components_found']:,}")
+    log.info(f"Components corrected:                     {stats['components_corrected']:,}")
+    log.info(f"Components — no valid ORF:                {stats['components_no_truth']:,}")
+    log.info(f"Components — ambiguous (resolved by BC):  {stats['components_multi_truth_resolved']:,}")
+    log.info(f"Components — ambiguous (tied, skipped):   {stats['components_multi_truth']:,}")
     log.info(divider)
 
 
