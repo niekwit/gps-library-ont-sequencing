@@ -11,7 +11,13 @@ Strategy
    has been appended).
 4. Group rows by gene_name.  Within each gene group:
    a. Find all pairs of distinct consensus_cdna sequences whose Levenshtein
-      distance is ≤ --threshold.
+      distance is ≤ --threshold, excluding pairs whose edits are clustered
+      within a codon-sized window (≤ --codon-window bp span, default 3).
+      Clustered edits indicate a genuine isoform difference (e.g. one extra
+      or missing codon, or a full codon replacement including XOX patterns
+      where only the first and third positions change) and should not be
+      collapsed.  Scattered substitutions typical of ONT sequencing errors
+      span positions far apart and are eligible for correction.
    b. Build a graph where each node is a unique consensus sequence and each
       edge connects two sequences within the threshold.  Identify connected
       components via BFS.
@@ -70,6 +76,17 @@ parser.add_argument(
     type=int,
     default=2,
     help="Maximum Levenshtein distance to consider two sequences as related (default: 2)",
+)
+parser.add_argument(
+    "--codon-window",
+    type=int,
+    default=3,
+    help=(
+        "Maximum bp span of all edits for a pair to be considered an isoform "
+        "difference rather than a sequencing error (default: 3, one codon). "
+        "Pairs whose edits are all clustered within this window are excluded "
+        "from correction. Increase to protect multi-codon isoform differences."
+    ),
 )
 parser.add_argument(
     "--log-file",
@@ -163,12 +180,52 @@ def is_valid_orf(seq: str) -> bool:
     return True
 
 
-def find_close_pairs(seqs: list[str], threshold: int) -> list[tuple[str, str, int]]:
-    """Returns all (seq_a, seq_b, distance) pairs with distance ≤ threshold.
+def is_isoform_like(seq_a: str, seq_b: str, codon_window: int) -> bool:
+    """Returns True if the edit pattern looks like a genuine isoform difference.
+
+    Isoform differences (e.g. one extra or missing codon) produce edits that
+    are all clustered within a small window (≥ 3 bp and ≤ codon_window bp total
+    span). Scattered ONT sequencing errors span positions far apart.
+
+    The span is measured from the start of the first edit to the end of the last
+    edit across both sequences, which correctly handles the XOX case — where only
+    positions 1 and 3 of a codon differ but position 2 is conserved — because the
+    total span (3 bp) still equals the codon size even though the middle base is
+    unchanged (producing two separate non-equal opcode blocks).
+
+    Examples (codon_window=3)
+    -------------------------
+    Single substitution      : span=1  →  1 < 3   → False (sequencing error)
+    Two adjacent subs        : span=2  →  2 < 3   → False (sequencing error)
+    Codon insertion          : span=3  →  3 in [3,3] → True  (isoform)
+    XOX codon change (pos 0,2): span=3 →  3 in [3,3] → True  (isoform)
+    Scattered subs (5, 1471) : span=1467 → > 3  → False (sequencing error)
+    """
+    ops = Levenshtein.opcodes(seq_a, seq_b)
+    non_equal = [op for op in ops if op.tag != "equal"]
+    if not non_equal:
+        return False
+
+    # Total span: start of earliest edit to end of latest edit in either sequence
+    min_src = min(op.src_start for op in non_equal)
+    max_src = max(op.src_end for op in non_equal)
+    min_dest = min(op.dest_start for op in non_equal)
+    max_dest = max(op.dest_end for op in non_equal)
+    edit_span = max(max_src - min_src, max_dest - min_dest)
+
+    return 3 <= edit_span <= codon_window
+
+
+def find_close_pairs(
+    seqs: list[str], threshold: int, codon_window: int
+) -> list[tuple[str, str, int]]:
+    """Returns close sequence pairs, excluding isoform-like differences.
 
     Sequences are sorted by length so the inner loop can break early: once the
     length difference alone exceeds the threshold, Levenshtein distance is
-    guaranteed to exceed it too, so all remaining comparisons can be skipped.
+    guaranteed to exceed it too. Pairs within the threshold that look like
+    genuine isoform differences (edits clustered within codon_window bp) are
+    excluded so they are not collapsed.
     """
     pairs = []
     sorted_seqs = sorted(seqs, key=len)
@@ -180,7 +237,9 @@ def find_close_pairs(seqs: list[str], threshold: int) -> list[tuple[str, str, in
             dist = Levenshtein.distance(
                 sorted_seqs[i], sorted_seqs[j], score_cutoff=threshold
             )
-            if dist <= threshold:
+            if dist <= threshold and not is_isoform_like(
+                sorted_seqs[i], sorted_seqs[j], codon_window
+            ):
                 pairs.append((sorted_seqs[i], sorted_seqs[j], dist))
     return pairs
 
@@ -218,10 +277,11 @@ def connected_components(pairs: list[tuple[str, str, int]]) -> list[set[str]]:
 
 
 def process():
-    log.info(f"Input CSV:   {args.input}")
-    log.info(f"Output CSV:  {args.output}")
-    log.info(f"Threshold:   {args.threshold}")
-    log.info(f"Log file:    {args.log_file}")
+    log.info(f"Input CSV:     {args.input}")
+    log.info(f"Output CSV:    {args.output}")
+    log.info(f"Threshold:     {args.threshold}")
+    log.info(f"Codon window:  {args.codon_window}")
+    log.info(f"Log file:      {args.log_file}")
 
     df = pd.read_csv(args.input)
     log.info(f"Loaded {len(df):,} rows from {args.input}")
@@ -269,7 +329,7 @@ def process():
             # Nothing to compare within a single-sequence gene
             continue
 
-        pairs = find_close_pairs(unique_seqs, args.threshold)
+        pairs = find_close_pairs(unique_seqs, args.threshold, args.codon_window)
         if not pairs:
             log.debug(f"Gene {gene_name}: no sequences within threshold, skipping")
             continue
@@ -308,7 +368,9 @@ def process():
                 if top == second:
                     # Barcode count is tied — collapse all tied candidates to an
                     # IUPAC consensus so the component is not simply discarded
-                    tied_orfs = [s for s in valid_orfs_sorted if seq_counts.get(s, 0) == top]
+                    tied_orfs = [
+                        s for s in valid_orfs_sorted if seq_counts.get(s, 0) == top
+                    ]
                     iupac_gt = compute_iupac_consensus(tied_orfs)
                     if iupac_gt is None:
                         stats["components_multi_truth"] += 1
@@ -370,16 +432,29 @@ def process():
     log.info(f"Input CSV:                    {args.input}")
     log.info(f"Output CSV:                   {args.output}")
     log.info(f"Levenshtein threshold:        {args.threshold}")
+    log.info(f"Codon window:                 {args.codon_window}")
     log.info(thin)
     log.info(f"Total rows:                   {len(df):,}")
     log.info(f"Rows corrected:               {stats['rows_corrected']:,}")
     log.info(thin)
-    log.info(f"ORF clusters found:                         {stats['components_found']:,}")
-    log.info(f"ORF clusters corrected:                     {stats['components_corrected']:,}")
-    log.info(f"ORF clusters — no valid ORF:                {stats['components_no_truth']:,}")
-    log.info(f"ORF clusters — ambiguous (resolved by BC):     {stats['components_multi_truth_resolved']:,}")
-    log.info(f"ORF clusters — ambiguous (resolved by IUPAC): {stats['components_iupac_resolved']:,}")
-    log.info(f"ORF clusters — ambiguous (tied, skipped):     {stats['components_multi_truth']:,}")
+    log.info(
+        f"ORF clusters found:                         {stats['components_found']:,}"
+    )
+    log.info(
+        f"ORF clusters corrected:                     {stats['components_corrected']:,}"
+    )
+    log.info(
+        f"ORF clusters — no valid ORF:                {stats['components_no_truth']:,}"
+    )
+    log.info(
+        f"ORF clusters — ambiguous (resolved by BC):     {stats['components_multi_truth_resolved']:,}"
+    )
+    log.info(
+        f"ORF clusters — ambiguous (resolved by IUPAC): {stats['components_iupac_resolved']:,}"
+    )
+    log.info(
+        f"ORF clusters — ambiguous (tied, skipped):     {stats['components_multi_truth']:,}"
+    )
     log.info(divider)
 
 
