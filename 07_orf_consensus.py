@@ -5,15 +5,23 @@ Reads in a barcode-sorted BAM of ONT reads aligned to Gencode cDNA sequences.
 For each barcode (representing a library member), the script:
 
 1. Groups reads by their BC tag and skips groups below MIN_READS.
-2. Identifies the primary isoform — the reference transcript that the majority
-   of reads in the group align to.
-3. Computes a confidence score: the fraction of reads supporting that isoform.
-4. Generates a pileup consensus from reads aligned to the primary isoform,
+2. Fetches the CDS sequence for every unique reference header seen among the
+   barcode's reads, using coordinates embedded in the Gencode header
+   (e.g. CDS:71-2188, 1-based inclusive).
+3. Identifies the primary isoform by voting on CDS sequence rather than on the
+   full header. Isoforms that differ only in their UTRs produce identical CDS
+   sequences and are therefore pooled together, preventing UTR variants from
+   splitting the read count across competing isoforms.
+4. Computes a confidence score: the fraction of reads supporting the primary CDS.
+5. Selects a representative header — the most common Gencode header among reads
+   supporting the primary CDS. This is used as the single coordinate reference
+   for pileup consensus generation, since reads from different isoforms have
+   different coordinate systems (CDS starts at different offsets due to varying
+   UTR lengths) and cannot be mixed in the pileup.
+6. Generates a pileup consensus from reads aligned to the representative isoform,
    recovering up to 10 bp of soft-clipped sequence on each end so that bases
    extending beyond the annotated transcript boundaries are not lost.
-5. Fetches the matching Gencode cDNA sequence from the reference FASTA and
-   trims it to the CDS only using coordinates embedded in the header.
-6. Writes one row per barcode to a CSV with the consensus, original CDS,
+7. Writes one row per barcode to a CSV with the consensus, original CDS,
    confidence score, and read counts.
 """
 
@@ -211,41 +219,72 @@ def process_to_csv():
                 )
                 continue
 
-            # Identify Majority Reference (Primary Isoform)
-            ref_counts = Counter(r.reference_name for r in reads if r.reference_name)
-            if not ref_counts:
+            # Fetch the CDS for every unique reference header seen in this group.
+            # Isoforms that differ only in UTRs will produce identical CDS sequences
+            # and should be counted together rather than competing against each other.
+            unique_headers = {r.reference_name for r in reads if r.reference_name}
+            if not unique_headers:
                 skipped_no_ref += 1
                 log.debug(f"Barcode {bc}: skipped (no aligned reference found)")
                 continue
 
-            full_header, primary_count = ref_counts.most_common(1)[0]
+            cds_by_header = {}
+            for h in unique_headers:
+                try:
+                    cds_by_header[h] = extract_cds(h, ref_seqs.fetch(h))
+                except KeyError:
+                    skipped_ref_not_found += 1
+                    log.warning(f"Barcode {bc}: reference not found in FASTA for {h}")
 
-            # Calculate Confidence Score
+            if not cds_by_header:
+                continue
+
+            # Vote on the primary isoform by CDS sequence rather than header,
+            # so that reads from UTR-differing isoforms of the same CDS are pooled.
+            cds_counts = Counter(
+                cds_by_header[r.reference_name]
+                for r in reads
+                if r.reference_name in cds_by_header
+            )
+            primary_cds, primary_count = cds_counts.most_common(1)[0]
+
+            # Confidence score: fraction of reads supporting the primary CDS
             confidence_score = round((primary_count / total_reads) * 100, 2)
 
-            # Extract Gene/Transcript name (5th element of | separated header)
+            # Collect all reads that map to the primary CDS
+            primary_reads = [
+                r for r in reads
+                if r.reference_name in cds_by_header
+                and cds_by_header[r.reference_name] == primary_cds
+            ]
+
+            # Reads from different isoforms use different coordinate systems
+            # (CDS starts at different offsets due to varying UTR lengths), so
+            # the pileup consensus must be built from reads aligned to a single
+            # reference. Pick the most common header among primary reads as the
+            # representative isoform.
+            header_counts = Counter(r.reference_name for r in primary_reads)
+            full_header = header_counts.most_common(1)[0][0]
+            consensus_reads = [r for r in primary_reads if r.reference_name == full_header]
+
+            if len(header_counts) > 1:
+                log.debug(
+                    f"Barcode {bc}: {len(header_counts)} isoforms share the same CDS — "
+                    f"merged for counting, consensus built from '{full_header.split('|')[4]}'"
+                )
+
             header_parts = full_header.split("|")
             short_name = header_parts[5] if len(header_parts) >= 6 else "Unknown"
+            original_cdna = primary_cds
 
             log.debug(
                 f"Barcode {bc}: gene={short_name}, total_reads={total_reads}, "
                 f"primary_reads={primary_count}, confidence={confidence_score}%"
             )
 
-            # Fetch GenCode cDNA sequence and trim to CDS only
-            try:
-                original_cdna = extract_cds(full_header, ref_seqs.fetch(full_header))
-            except KeyError:
-                skipped_ref_not_found += 1
-                log.warning(
-                    f"Barcode {bc}: reference sequence not found in FASTA for {full_header}"
-                )
-                original_cdna = "REF_NOT_FOUND"
-
-            # Generate consensus using ONLY reads aligned to the primary reference
+            # Generate consensus from reads aligned to the representative isoform
             ref_len = bam.header.get_reference_length(full_header)
-            primary_reads = [r for r in reads if r.reference_name == full_header]
-            consensus = get_pileup_consensus(primary_reads, ref_len)
+            consensus = get_pileup_consensus(consensus_reads, ref_len)
 
             results.append(
                 {
