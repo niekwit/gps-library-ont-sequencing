@@ -206,7 +206,9 @@ def process_to_csv():
 
             if total_reads < MIN_READS:
                 skipped_low_reads += 1
-                log.debug(f"Barcode {bc}: skipped ({total_reads} reads < {MIN_READS} minimum)")
+                log.debug(
+                    f"Barcode {bc}: skipped ({total_reads} reads < {MIN_READS} minimum)"
+                )
                 continue
 
             # Identify Majority Reference (Primary Isoform)
@@ -235,7 +237,9 @@ def process_to_csv():
                 original_cdna = extract_cds(full_header, ref_seqs.fetch(full_header))
             except KeyError:
                 skipped_ref_not_found += 1
-                log.warning(f"Barcode {bc}: reference sequence not found in FASTA for {full_header}")
+                log.warning(
+                    f"Barcode {bc}: reference sequence not found in FASTA for {full_header}"
+                )
                 original_cdna = "REF_NOT_FOUND"
 
             # Generate consensus using ONLY reads aligned to the primary reference
