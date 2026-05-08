@@ -106,6 +106,7 @@ for _noisy in ("httpcore", "httpx", "mygene"):
 # Load reference libraries
 # ---------------------------------------------------------------------------
 
+
 def load_references(orf81_path: str, uorf_path: str):
     """Returns two dicts: gene → list of (nt_seq, ref_id).
 
@@ -135,6 +136,7 @@ def load_references(orf81_path: str, uorf_path: str):
 # ---------------------------------------------------------------------------
 # Library type detection
 # ---------------------------------------------------------------------------
+
 
 def library_for_barcode_len(barcode_len: int) -> str | None:
     """Returns 'orf81', 'uorf', or None if length is ambiguous."""
@@ -184,6 +186,7 @@ def get_aliases(gene_name: str) -> list[str]:
 # Sequence matching
 # ---------------------------------------------------------------------------
 
+
 def find_best_match(
     query: str,
     candidates: list[tuple[str, object]],
@@ -203,6 +206,7 @@ def find_best_match(
 # ---------------------------------------------------------------------------
 # Main processing
 # ---------------------------------------------------------------------------
+
 
 def process():
     log.info(f"Input CSV:       {args.input}")
@@ -264,7 +268,9 @@ def process():
 
         if candidates is None:
             stats["gene_not_found"] += 1
-            log.debug(f"Gene {gene_name}: not found in {lib} reference (including aliases)")
+            log.debug(
+                f"Gene {gene_name}: not found in {lib} reference (including aliases)"
+            )
             continue
 
         # Match each unique original_cdna against reference candidates once,
